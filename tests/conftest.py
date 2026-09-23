@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from tenable_patch_management_logs_mcp import customknowledge
 from tenable_patch_management_logs_mcp.sources import SourceRegistry
 from tests.sample_logs import build_sample_tree
 
@@ -15,12 +16,13 @@ def sample_tree(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     return build_sample_tree(tmp_path_factory.mktemp("samples"))
 
 
-def make_registry(data_dir: Path, **sources: Path) -> SourceRegistry:
-    env = {
+def make_registry(data_dir: Path, *, env: dict[str, str] | None = None, **sources: Path) -> SourceRegistry:
+    settings = {
         "TPM_LOG_SOURCES": ";".join(f"{name}={path}" for name, path in sources.items()),
         "TPM_AUTO_DISCOVER": "false",
+        **(env or {}),
     }
-    return SourceRegistry(data_dir=data_dir, env=env)
+    return SourceRegistry(data_dir=data_dir, env=settings)
 
 
 @pytest.fixture()
@@ -34,3 +36,11 @@ def registry(tmp_path: Path, sample_tree: dict[str, Path]) -> SourceRegistry:
             "client13": sample_tree["client13_file"],
         },
     )
+
+
+@pytest.fixture(autouse=True)
+def _forget_site_knowledge() -> None:
+    """A knowledge file loaded by one test must never leak into the next."""
+    customknowledge.reset()
+    yield
+    customknowledge.reset()

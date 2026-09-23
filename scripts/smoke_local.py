@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -22,9 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 WORK = Path(tempfile.mkdtemp(prefix="tpm-smoke-"))
 os.environ["TPM_MCP_DATA_DIR"] = str(WORK / "data")
 os.environ["TPM_AUTO_DISCOVER"] = "false"
-os.environ.pop("TPM_LOG_SOURCES", None)
+for leftover in ("TPM_LOG_SOURCES", "TPM_LOG_TIMEZONES", "TPM_DISPLAY_TIMEZONE", "TPM_KNOWLEDGE_FILE"):
+    os.environ.pop(leftover, None)
 
-from tenable_patch_management_logs_mcp import server  # noqa: E402
+from tenable_patch_management_logs_mcp import customknowledge, server  # noqa: E402
 from tests.sample_logs import PLANTED_KEY, PLANTED_TOKEN, build_sample_tree  # noqa: E402
 
 failures: list[str] = []
@@ -98,7 +100,57 @@ check("feed failure spike flagged", any(f["type"] == "error_spike" and f["known_
                                         for f in anomalies["findings"]))
 check("restart loop flagged", anomalies["findings_by_type"].get("service_restarts") == 1)
 
-print("\n6. explain and error handling")
+print("\n6. time zones, anchors, site knowledge and recorded baselines")
+client13_before = {d["device"]: d["last_entry"] for d in by_name["client13"]["devices"]}["client-13"]
+(WORK / "known_issues.json").write_text(json.dumps({
+    "known_issues": [{
+        "id": "site_feed_timeouts",
+        "title": "Site: feed timeouts already ticketed (OPS-4711)",
+        "pattern": "An exception arose trying to retrieve new Feed instructions",
+        "impact": "none",
+    }],
+    "patch_deployment_results": {"reason_code": {"3010": "Success, reboot required"}},
+}), encoding="utf-8")
+os.environ["TPM_LOG_TIMEZONES"] = "client13=+08:00"
+os.environ["TPM_DISPLAY_TIMEZONE"] = "UTC"
+os.environ["TPM_KNOWLEDGE_FILE"] = str(WORK / "known_issues.json")
+customknowledge.reset()
+server._registry = None  # re-read the configuration, as a restarted server would
+
+configured = server.check_log_sources()
+client13_after = {d["device"]: d["last_entry"] for s in configured["sources"] if s["name"] == "client13"
+                  for d in s["devices"]}["client-13"]
+check("display zone reported", configured["configuration"]["time_zones"]["display_timezone"] == "UTC")
+check("client logs converted into the display zone",
+      datetime.fromisoformat(client13_before) - datetime.fromisoformat(client13_after) == timedelta(hours=8),
+      f"{client13_before} -> {client13_after}")
+shifted_summary = server.summarize_errors(since="24h")
+check("conversion stated in the results", "Times are shown in UTC" in shifted_summary["timestamps_note"])
+
+from_clock = server.summarize_errors(since="24h", anchor="now")
+check("anchor=now measures from the clock", from_clock["window"]["anchor"]["mode"] == "now")
+check("stale devices named", bool(from_clock["window"].get("devices_behind_anchor")),
+      f"{len(from_clock['window'].get('devices_behind_anchor', []))} device(s) behind")
+check("bad anchor returns a structured error", server.summarize_errors(anchor="soon")["error"] == "invalid_input")
+
+site = {row["known_issue"]: row for row in shifted_summary["noise"]}
+check("site knowledge file loaded",
+      configured["configuration"]["site_knowledge"]["known_issues_loaded"] == 1)
+check("site signature set aside as noise", "site_feed_timeouts" in site)
+check("site issue explained", server.explain("site_feed_timeouts")["from_site_knowledge_file"] is True)
+check("site mappings decode deployment results",
+      "reason_code: 1" in server.diagnose("patch_install_failed", since="30d")["details"]["note"])
+
+snapshot = server.record_baseline_snapshot(since="30d")
+check("baseline snapshot written", snapshot["ok"] is True and snapshot["signature_days_written"] > 0,
+      snapshot.get("message", ""))
+again = server.record_baseline_snapshot(since="30d")
+check("re-recording does not inflate the store",
+      again["store_state"]["signature_days"] == snapshot["store_state"]["signature_days"])
+check("recorded history is reported",
+      server.detect_log_anomalies(since="24h")["baseline_history"]["recorded"] is True)
+
+print("\n7. explain and error handling")
 check("error code explained", server.explain("0x80070643")["name"] == "HRESULT_FROM_WIN32(ERROR_INSTALL_FAILURE)")
 bad = server.summarize_errors(since="last tuesday")
 check("bad time returns a structured error", bad["ok"] is False and bad["error"] == "invalid_input")

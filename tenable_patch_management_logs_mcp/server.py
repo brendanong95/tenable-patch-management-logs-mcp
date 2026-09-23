@@ -49,8 +49,9 @@ INSTRUCTIONS = (
     "diagnose; use search_logs and build_timeline to confirm details. Counts, grouping across duplicate log "
     "files, error-code decoding and known-issue matching are done server-side - use the numbers as given. "
     "Quote the file and line ('log', 'line' or 'at') so findings can be verified. Relative times such as 24h "
-    "count back from the newest log entry, not from now. Known platform noise is set aside by default and "
-    "reported separately."
+    "count back from the newest log entry, not from now; pass anchor='now' to measure from the clock instead. "
+    "Timestamps are shown as written unless log time zones are configured, and every result says which. "
+    "Known platform noise is set aside by default and reported separately."
 )
 
 mcp = FastMCP(SERVER_NAME, version=SERVER_VERSION, instructions=INSTRUCTIONS)
@@ -119,7 +120,8 @@ def check_log_sources() -> dict[str, Any]:
 
 
 @_tool(read_only=False)
-def add_log_source(name: str, path: str, deployment: str = "auto") -> dict[str, Any]:
+def add_log_source(name: str, path: str, deployment: str = "auto",
+                   timezone: str | None = None) -> dict[str, Any]:
     """Register TPM logs to analyse; remembered between sessions.
 
     Nothing at ``path`` is modified. Bundles are extracted once into the server's data
@@ -132,13 +134,16 @@ def add_log_source(name: str, path: str, deployment: str = "auto") -> dict[str, 
             a single log file (e.g. 13_adaptiva.log requested from a client), or a .zip /
             .tar.gz bundle such as the Admin Portal "Download All Server Logs" zip.
         deployment: "saas", "onprem" or "auto" (infer from the logs).
+        timezone: Zone these logs are written in, for mixing machines from different
+            zones: an IANA name ("Asia/Singapore"), a fixed offset ("+08:00"), "UTC" or
+            "local". Times are then shown in TPM_DISPLAY_TIMEZONE (UTC by default).
 
     Returns:
         The registered source, the devices and log counts found, and the next step.
     """
     try:
         registry = get_registry()
-        source = registry.add(name, path, deployment)
+        source = registry.add(name, path, deployment, timezone)
         files = registry.files(source)
         return {
             "ok": True,
@@ -203,6 +208,7 @@ def list_log_files(
 def summarize_errors(
     since: str | None = "7d",
     until: str | None = None,
+    anchor: str | None = None,
     source: str | None = None,
     device: str | None = None,
     role: str | None = None,
@@ -225,6 +231,8 @@ def summarize_errors(
         since: Window start: ISO time (2026-09-17T08:00) or relative (90m, 24h, 7d, 2w)
             counted back from the newest log entry. Default 7d.
         until: Window end (same formats). Default: newest entry.
+        anchor: What relative times count back from: "newest" (default, the newest entry
+            in the selected logs), "now" (this machine's clock) or an ISO time.
         source: Source name; omit for all sources.
         device: Only this device.
         role: "server", "client" or "setup".
@@ -238,8 +246,8 @@ def summarize_errors(
     """
     try:
         return analysis.summarize_errors(
-            get_registry(), source=source, since=since, until=until, min_severity=min_severity, device=device,
-            role=role, files=files, include_noise=include_noise, top=top,
+            get_registry(), source=source, since=since, until=until, anchor=anchor, min_severity=min_severity,
+            device=device, role=role, files=files, include_noise=include_noise, top=top,
         )
     except Exception as exc:  # noqa: BLE001
         return _fail(exc)
@@ -252,6 +260,7 @@ def search_logs(
     case_sensitive: bool = False,
     since: str | None = None,
     until: str | None = None,
+    anchor: str | None = None,
     source: str | None = None,
     device: str | None = None,
     role: str | None = None,
@@ -275,6 +284,8 @@ def search_logs(
         case_sensitive: Default false.
         since: Window start (ISO or relative like 24h); default all history.
         until: Window end.
+        anchor: What relative times count back from: "newest" (default, the newest entry
+            in the selected logs), "now" (this machine's clock) or an ISO time.
         source: Source name; omit for all sources.
         device: Only this device.
         role: "server", "client" or "setup".
@@ -292,7 +303,8 @@ def search_logs(
     try:
         return analysis.search_logs(
             get_registry(), pattern, regex=regex, case_sensitive=case_sensitive, source=source, since=since,
-            until=until, min_severity=min_severity, device=device, role=role, files=files, component=component,
+            until=until, anchor=anchor, min_severity=min_severity, device=device, role=role, files=files,
+            component=component,
             context=context, limit=limit, offset=offset, order=order,
         )
     except Exception as exc:  # noqa: BLE001
@@ -306,6 +318,7 @@ def build_timeline(
     minutes_after: int = 15,
     since: str | None = None,
     until: str | None = None,
+    anchor: str | None = None,
     source: str | None = None,
     device: str | None = None,
     role: str | None = None,
@@ -329,6 +342,8 @@ def build_timeline(
         minutes_after: Minutes after ``around`` (default 15).
         since: Window start when not using ``around``. Default: the last 60 minutes of logs.
         until: Window end when not using ``around``.
+        anchor: What relative times count back from: "newest" (default, the newest entry
+            in the selected logs), "now" (this machine's clock) or an ISO time.
         source: Source name; omit for all sources.
         device: Only this device.
         role: "server", "client" or "setup".
@@ -345,8 +360,9 @@ def build_timeline(
     """
     try:
         return analysis.build_timeline(
-            get_registry(), source=source, since=since, until=until, around=around, minutes_before=minutes_before,
-            minutes_after=minutes_after, device=device, role=role, files=files, min_severity=min_severity,
+            get_registry(), source=source, since=since, until=until, anchor=anchor, around=around,
+            minutes_before=minutes_before, minutes_after=minutes_after, device=device, role=role, files=files,
+            min_severity=min_severity,
             keyword=keyword, include_noise=include_noise, collapse_repeats=collapse_repeats, limit=limit,
         )
     except Exception as exc:  # noqa: BLE001
@@ -358,6 +374,7 @@ def diagnose(
     symptom: str,
     since: str | None = "7d",
     until: str | None = None,
+    anchor: str | None = None,
     source: str | None = None,
     device: str | None = None,
 ) -> dict[str, Any]:
@@ -381,6 +398,8 @@ def diagnose(
         symptom: One of the symptom ids above.
         since: Window start (ISO or relative like 24h). Default 7d.
         until: Window end.
+        anchor: What relative times count back from: "newest" (default, the newest entry
+            in the selected logs), "now" (this machine's clock) or an ISO time.
         source: Source name; omit for all sources.
         device: Only this device.
 
@@ -389,7 +408,9 @@ def diagnose(
         playbook-specific ``details``, ``missing_logs`` with how to get them, and ``advice``.
     """
     try:
-        return analysis.diagnose(get_registry(), symptom, source=source, since=since, until=until, device=device)
+        return analysis.diagnose(
+            get_registry(), symptom, source=source, since=since, until=until, anchor=anchor, device=device
+        )
     except Exception as exc:  # noqa: BLE001
         return _fail(exc)
 
@@ -400,6 +421,7 @@ def compare_devices(
     problem_device: str,
     since: str | None = "7d",
     until: str | None = None,
+    anchor: str | None = None,
     source: str | None = None,
     min_severity: str = "WARN",
     include_noise: bool = False,
@@ -412,6 +434,8 @@ def compare_devices(
         problem_device: The device with the problem.
         since: Window start (ISO or relative). Default 7d.
         until: Window end.
+        anchor: What relative times count back from: "newest" (default, the newest entry
+            in the selected logs), "now" (this machine's clock) or an ISO time.
         source: Source name; omit for all sources.
         min_severity: WARN (default) or ERROR.
         include_noise: Include known platform noise.
@@ -422,7 +446,7 @@ def compare_devices(
     """
     try:
         return analysis.compare_devices(
-            get_registry(), healthy_device, problem_device, source=source, since=since, until=until,
+            get_registry(), healthy_device, problem_device, source=source, since=since, until=until, anchor=anchor,
             min_severity=min_severity, include_noise=include_noise, top=top,
         )
     except Exception as exc:  # noqa: BLE001
@@ -433,10 +457,12 @@ def compare_devices(
 def detect_log_anomalies(
     since: str | None = "24h",
     until: str | None = None,
+    anchor: str | None = None,
     baseline_days: int = 7,
     source: str | None = None,
     device: str | None = None,
     role: str | None = None,
+    use_history: bool = True,
 ) -> dict[str, Any]:
     """Compare a recent window with the days before it, in the same logs.
 
@@ -448,10 +474,14 @@ def detect_log_anomalies(
     Args:
         since: Window start (ISO or relative like 24h, counted back from the newest entry).
         until: Window end. Default: newest entry.
+        anchor: What relative times count back from: "newest" (default, the newest entry
+            in the selected logs), "now" (this machine's clock) or an ISO time.
         baseline_days: Days before the window to compare against (1-90, default 7).
         source: Source name; omit for all sources.
         device: Only this device.
         role: "server", "client" or "setup".
+        use_history: Also use baselines saved by record_baseline_snapshot for days the
+            logs no longer reach (default true; ignored when nothing was recorded).
 
     Returns:
         Severity-ordered ``findings``, counts by type and severity, baseline coverage and
@@ -459,8 +489,44 @@ def detect_log_anomalies(
     """
     try:
         return anomaly.detect_log_anomalies(
-            get_registry(), source=source, since=since, until=until, baseline_days=baseline_days, device=device,
-            role=role,
+            get_registry(), source=source, since=since, until=until, anchor=anchor, baseline_days=baseline_days,
+            device=device, role=role, use_history=use_history,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc)
+
+
+@_tool(read_only=False)
+def record_baseline_snapshot(
+    since: str | None = "30d",
+    until: str | None = None,
+    anchor: str | None = None,
+    source: str | None = None,
+    device: str | None = None,
+    role: str | None = None,
+) -> dict[str, Any]:
+    """Save today's error rates so anomaly detection still has a baseline after rotation.
+
+    detect_log_anomalies compares a window with the days before it in the same logs, so
+    heavily rotated logs give it a short baseline. This writes the per-day counts it can
+    see now - device, component, normalised signature, day, count; no message text - to
+    <data dir>/baselines.db, and later runs read those days back. Nothing in the logs is
+    modified. Re-running over the same days is safe: the larger count for a day wins.
+
+    Args:
+        since: Start of the period to record (ISO or relative like 30d). Default 30d.
+        until: End of the period. Default: newest entry.
+        anchor: What relative times count back from: "newest" (default), "now" or an ISO time.
+        source: Source name; omit for all sources.
+        device: Only this device.
+        role: "server", "client" or "setup".
+
+    Returns:
+        What was written, the days now held in the store, and where the file is.
+    """
+    try:
+        return anomaly.record_baseline_snapshot(
+            get_registry(), source=source, since=since, until=until, anchor=anchor, device=device, role=role,
         )
     except Exception as exc:  # noqa: BLE001
         return _fail(exc)

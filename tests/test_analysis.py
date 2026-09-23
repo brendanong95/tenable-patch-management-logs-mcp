@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -320,3 +321,76 @@ def test_explain(topic, kind):
 def test_explain_unknown_topic():
     with pytest.raises(InputError):
         analysis.explain("zzzz-nothing-matches-this")
+
+
+# --------------------------------------------------------------------------- #
+# Anchors and time zones
+# --------------------------------------------------------------------------- #
+
+
+def test_relative_windows_count_back_from_the_newest_entry_by_default(registry):
+    window = analysis.summarize_errors(registry, since="24h")["window"]
+    assert window["anchor"] == {"mode": analysis.ANCHOR_NEWEST, "time": "2026-09-10 12:00:03.000"}
+    assert window["to_is_newest_entry"] is True
+    assert "devices_behind_anchor" not in window
+
+
+def test_anchor_now_measures_from_the_clock_and_names_the_stale_devices(registry):
+    result = analysis.summarize_errors(registry, since="24h", anchor="now")
+    window = result["window"]
+    assert window["anchor"]["mode"] == analysis.ANCHOR_NOW
+    assert window["to_is_newest_entry"] is False
+    # The sample logs end in the past, so every device is behind the clock and is named.
+    behind = {row["device"] for row in window["devices_behind_anchor"]}
+    assert {"server", "client-13", "WS-BAD07"} <= behind
+    assert all(row["hours_behind_anchor"] > 0 for row in window["devices_behind_anchor"])
+    assert "Filter by device" in window["anchor_note"]
+    assert result["totals"]["events"] == 0  # nothing was logged in the last 24 hours
+
+
+def test_an_explicit_anchor_moves_the_window(registry):
+    window = analysis.summarize_errors(registry, since="24h", anchor="2026-09-09T12:00")["window"]
+    assert window["anchor"] == {"mode": analysis.ANCHOR_EXPLICIT, "time": "2026-09-09 12:00:00.000"}
+    assert window["from"].startswith("2026-09-08 12:00")
+    assert window["to"].startswith("2026-09-09 12:00")
+
+
+def test_devices_whose_logs_end_early_are_named(registry):
+    # Anchored two days after the logs end: every device is behind, the earliest one by the most.
+    window = analysis.build_timeline(registry, since="24h", anchor="2026-09-12T00:00")["window"]
+    behind = {row["device"]: row for row in window["devices_behind_anchor"]}
+    assert set(behind) == {"server", "client-13", "WS-BAD07", "WS-GOOD01"}
+    assert behind["WS-BAD07"]["hours_behind_anchor"] > behind["server"]["hours_behind_anchor"]
+    assert behind["server"]["last_entry"].startswith("2026-09-10 12:00")
+    assert "covers less of their history" in window["anchor_note"]
+
+
+def test_an_unusable_anchor_is_rejected_with_the_choices(registry):
+    with pytest.raises(InputError) as raised:
+        analysis.summarize_errors(registry, since="24h", anchor="last tuesday")
+    assert "newest" in (raised.value.remediation or "") and "now" in (raised.value.remediation or "")
+
+
+def test_mixed_zones_are_converted_and_reported(tmp_path, sample_tree):
+    plain = make_registry(
+        tmp_path / "plain",
+        **{"saas-server": sample_tree["server_zip"], "client13": sample_tree["client13_file"]},
+    )
+    shifted = make_registry(
+        tmp_path / "shifted",
+        env={"TPM_LOG_TIMEZONES": "saas-server=UTC;client13=+08:00", "TPM_DISPLAY_TIMEZONE": "UTC"},
+        **{"saas-server": sample_tree["server_zip"], "client13": sample_tree["client13_file"]},
+    )
+    before = {row["device"]: row["last_entry"] for source in analysis.check_sources(plain)["sources"]
+              for row in source["devices"]}
+    after = {row["device"]: row["last_entry"] for source in analysis.check_sources(shifted)["sources"]
+             for row in source["devices"]}
+    assert after["server"] == before["server"]  # already UTC
+    assert after["client-13"] < before["client-13"]  # +08:00 shown in UTC
+    assert (datetime.fromisoformat(before["client-13"]) - datetime.fromisoformat(after["client-13"])
+            == timedelta(hours=8))
+
+    summary = analysis.summarize_errors(shifted, since="7d")
+    assert "Times are shown in UTC" in summary["timestamps_note"]
+    assert analysis.check_sources(shifted)["configuration"]["time_zones"]["display_timezone"] == "UTC"
+    assert "exactly as written" in analysis.summarize_errors(plain, since="7d")["timestamps_note"]

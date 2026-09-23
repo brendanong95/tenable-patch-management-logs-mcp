@@ -18,6 +18,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .timezones import BASE_NOTE
+
 # --------------------------------------------------------------------------- #
 # Sources
 # --------------------------------------------------------------------------- #
@@ -955,7 +957,5 @@ LOG_ACQUISITION: dict[str, str] = {
              "Server\\AdaptivaServerSetup.log on an on-prem server).",
 }
 
-TIMESTAMP_NOTE = (
-    "Timestamps are shown exactly as written in the logs. TPM 10.2 SaaS server logs and Windows client logs "
-    "were observed to be written in UTC; on-prem servers may use the server's local time."
-)
+#: Kept here for callers that want the caveat without the timezone machinery.
+TIMESTAMP_NOTE = BASE_NOTE

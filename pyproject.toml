@@ -1,6 +1,6 @@
 [project]
 name = "tenable-patch-management-logs-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that digs through Tenable Patch Management (SaaS and on-prem) server and client logs"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,8 @@ classifiers = [
 dependencies = [
     "mcp==2.0.0",
     "python-dotenv==1.2.2",
+    # Named time zones (Asia/Singapore) need a tz database; Windows has none.
+    "tzdata==2026.2; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

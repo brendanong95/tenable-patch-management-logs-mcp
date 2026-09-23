@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import zipfile
-from pathlib import Path
 
 import pytest
 
 from tenable_patch_management_logs_mcp.errors import InputError, NoSourcesError, SourceError
 from tenable_patch_management_logs_mcp.sources import SourceRegistry, detect_device, detect_role, logical_name
+from tenable_patch_management_logs_mcp.timezones import IDENTITY
 from tests.conftest import make_registry
-from tests.sample_logs import build_single_client_log, malicious_zip, zip_folder
+from tests.sample_logs import build_single_client_log, malicious_zip
 
 
 @pytest.mark.parametrize(
@@ -208,3 +208,56 @@ def test_auto_discovery_finds_a_local_client(tmp_path):
     assert "local-client" in names
     [local] = [s for s in registry.sources() if s.name == "local-client"]
     assert [f.role for f in registry.files(local)] == ["client"]
+
+
+# --------------------------------------------------------------------------- #
+# Time zones
+# --------------------------------------------------------------------------- #
+
+
+def test_files_carry_the_zone_configured_for_their_source(tmp_path, sample_tree):
+    registry = make_registry(
+        tmp_path / "data",
+        env={"TPM_LOG_TIMEZONES": "clients=+08:00", "TPM_DISPLAY_TIMEZONE": "UTC"},
+        clients=sample_tree["clients_dir"],
+    )
+    [source] = registry.sources()
+    files = registry.files(source)
+    assert {f.shift.written_in.name for f in files} == {"UTC+08:00"}
+    assert {f.shift.shown_in.name for f in files} == {"UTC"}
+    assert files[0].to_dict()["timezone"] == {"written_in": "UTC+08:00", "shown_in": "UTC"}
+
+
+def test_a_device_can_have_its_own_zone(tmp_path, sample_tree):
+    registry = make_registry(
+        tmp_path / "data",
+        env={"TPM_LOG_TIMEZONES": "ws-bad07=+09:00;*=UTC", "TPM_DISPLAY_TIMEZONE": "UTC"},
+        clients=sample_tree["clients_dir"],
+    )
+    [source] = registry.sources()
+    zones = {f.device: f.shift.written_in.name for f in registry.files(source)}
+    assert zones["WS-BAD07"] == "UTC+09:00"
+    assert zones["WS-GOOD01"] == "UTC"
+
+
+def test_without_configuration_files_are_left_as_written(tmp_path, sample_tree):
+    registry = make_registry(tmp_path / "data", clients=sample_tree["clients_dir"])
+    [source] = registry.sources()
+    files = registry.files(source)
+    assert all(f.shift is IDENTITY for f in files)
+    assert "timezone" not in files[0].to_dict()
+
+
+def test_add_log_source_remembers_a_zone_and_refuses_a_bad_one(tmp_path, sample_tree):
+    registry = make_registry(tmp_path / "data", env={"TPM_DISPLAY_TIMEZONE": "UTC"})
+    source = registry.add("clients", str(sample_tree["clients_dir"]), timezone="+08:00")
+    assert source.timezone == "+08:00"
+    assert source.to_dict()["timezone"] == "+08:00"
+    reloaded = SourceRegistry(data_dir=tmp_path / "data", env={"TPM_DISPLAY_TIMEZONE": "UTC",
+                                                               "TPM_AUTO_DISCOVER": "false"})
+    [stored] = reloaded.sources()
+    assert stored.timezone == "+08:00"
+    assert {f.shift.written_in.name for f in reloaded.files(stored)} == {"UTC+08:00"}
+
+    with pytest.raises(InputError):
+        registry.add("elsewhere", str(sample_tree["clients_dir"]), timezone="Mars/Olympus")

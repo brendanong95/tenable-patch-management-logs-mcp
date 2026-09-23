@@ -22,7 +22,10 @@ Installer verbose log that TPM clients keep in msiLogs/.
 * ``plain`` - fallback where every non-empty line is its own entry, so an unrecognised
   format can never collapse a whole file into a single entry.
 
-Timestamps are returned naive, exactly as written in the file.
+Timestamps are returned naive, exactly as written in the file, with any UTC offset the
+line carried kept separately in ``LogEntry.utc_offset``. Callers that mix logs from
+several machines pass a ``shift`` (see ``timezones.TimeShift``) to have every timestamp
+converted into one zone as it is read.
 """
 
 from __future__ import annotations
@@ -113,6 +116,9 @@ _GENERIC_START = re.compile(
 )
 _LEVEL_WORD = re.compile(r"\b(TRACE|DEBUG|INFO|WARN(?:ING)?|ERROR|ERR|FATAL|SEVERE|CRITICAL)\b")
 
+#: Trailing UTC offset on an ISO timestamp (journalctl exports, some setup logs).
+_TS_OFFSET = re.compile(r"(?:(?P<z>Z)|(?P<sign>[+-])(?P<hours>\d{2}):?(?P<minutes>\d{2}))$")
+
 _TS_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:[.,](\d{1,9}))?")
 _TS_WORKFLOW = re.compile(r"^(\d{2})-(\d{2})-(\d{4}) (\d{2}):(\d{2}):(\d{2}):(\d{1,3})")
 _TS_SLASH = re.compile(
@@ -142,6 +148,8 @@ class LogEntry:
     detail_dropped: int = 0
     end_line: int = 0
     time_inferred: bool = False
+    #: UTC offset written on the line itself, when it had one.
+    utc_offset: timedelta | None = None
 
     @property
     def detail_count(self) -> int:
@@ -237,6 +245,30 @@ def parse_timestamp(text: str | None) -> datetime | None:
     except ValueError:
         return None
     return None
+
+
+def timestamp_offset(text: str | None) -> timedelta | None:
+    """The UTC offset a timestamp carried, if any: ``2026-09-17T08:00:00+02:00`` -> +2h."""
+    if not text:
+        return None
+    match = _TS_OFFSET.search(text.strip())
+    if not match:
+        return None
+    if match.group("z"):
+        return timedelta(0)
+    delta = timedelta(hours=int(match.group("hours")), minutes=int(match.group("minutes")))
+    return -delta if match.group("sign") == "-" else delta
+
+
+class _NoShift:
+    """Default time conversion: none. Mirrors ``timezones.TimeShift``."""
+
+    @staticmethod
+    def apply(value: datetime | None, offset: timedelta | None = None) -> datetime | None:
+        return value
+
+
+NO_SHIFT = _NoShift()
 
 
 def _apply_suffix(entry: LogEntry, text: str, *, set_message: bool) -> bool:
@@ -445,6 +477,7 @@ class _Parser:
                     raw=line,
                     layout=LAYOUT_TIMESTAMPED,
                     end_line=line_no,
+                    utc_offset=timestamp_offset(match.group("ts")),
                 )
         return None
 
@@ -538,8 +571,13 @@ def iter_entries(
     path: Path,
     layout: str | None = None,
     stats: ParseStats | None = None,
+    shift: Any = NO_SHIFT,
 ) -> Iterator[LogEntry]:
-    """Stream entries from one file. Memory use is bounded by a single entry."""
+    """Stream entries from one file. Memory use is bounded by a single entry.
+
+    ``shift`` converts each timestamp into a common zone as the entry is finished; the
+    default leaves it exactly as written.
+    """
     layout = layout or sniff_layout(path)
     stats = stats if stats is not None else ParseStats()
     stats.layout = layout
@@ -551,6 +589,7 @@ def iter_entries(
         stats.entries += 1
         if entry.timestamp is not None:
             stats.timestamped_entries += 1
+            entry.timestamp = shift.apply(entry.timestamp, entry.utc_offset)
         return entry
 
     with open_text(path) as fh:
@@ -594,7 +633,7 @@ def iter_entries(
         yield finish(current)
 
 
-def _tail_timestamp(path: Path, layout: str) -> datetime | None:
+def _tail_timestamp(path: Path, layout: str, shift: Any = NO_SHIFT) -> datetime | None:
     """Newest timestamp, read from the last ``TAIL_BYTES`` of the file."""
     _, raw_codec = _encodings(path)
     width = 2 if raw_codec.startswith("utf-16") else 1
@@ -613,30 +652,32 @@ def _tail_timestamp(path: Path, layout: str) -> datetime | None:
             continue
         entry = parser.start(line.lstrip("﻿"), 0)
         if entry is not None and entry.timestamp is not None:
-            return entry.timestamp
+            return shift.apply(entry.timestamp, entry.utc_offset)
     return None
 
 
-def time_span(path: Path, layout: str | None = None) -> tuple[datetime | None, datetime | None]:
+def time_span(
+    path: Path, layout: str | None = None, shift: Any = NO_SHIFT
+) -> tuple[datetime | None, datetime | None]:
     """``(first, last)`` timestamps of a file without parsing all of it."""
     layout = layout or sniff_layout(path)
     compressed = path.name.lower().endswith(".gz")
     try:
         if layout == LAYOUT_MSI or compressed:
             if compressed and path.stat().st_size > MAX_GZ_SPAN_BYTES:
-                return _head_timestamp(path, layout), None
+                return _head_timestamp(path, layout, shift), None
             first = last = None
-            for entry in iter_entries(path, layout):
+            for entry in iter_entries(path, layout, shift=shift):
                 if entry.timestamp is not None:
                     first = first or entry.timestamp
                     last = entry.timestamp
             return first, last
-        return _head_timestamp(path, layout), _tail_timestamp(path, layout)
+        return _head_timestamp(path, layout, shift), _tail_timestamp(path, layout, shift)
     except (OSError, EOFError, gzip.BadGzipFile):
         return None, None
 
 
-def _head_timestamp(path: Path, layout: str) -> datetime | None:
+def _head_timestamp(path: Path, layout: str, shift: Any = NO_SHIFT) -> datetime | None:
     parser = _Parser(layout, _mtime_date(path))
     with open_text(path) as fh:
         for index, raw in enumerate(fh):
@@ -647,5 +688,5 @@ def _head_timestamp(path: Path, layout: str) -> datetime | None:
                 continue
             entry = parser.start(line, index + 1)
             if entry is not None and entry.timestamp is not None:
-                return entry.timestamp
+                return shift.apply(entry.timestamp, entry.utc_offset)
     return None

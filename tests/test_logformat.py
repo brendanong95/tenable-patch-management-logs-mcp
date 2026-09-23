@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import gzip
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from tenable_patch_management_logs_mcp.timezones import TimeShift, parse_zone
 from tenable_patch_management_logs_mcp.logformat import (
     LAYOUT_ADAPTIVA,
     LAYOUT_BLOCKS,
@@ -18,6 +19,7 @@ from tenable_patch_management_logs_mcp.logformat import (
     RUNAWAY_DETAIL_LINES,
     ParseStats,
     iter_entries,
+    timestamp_offset,
     normalize_level,
     parse_timestamp,
     sniff_layout,
@@ -283,3 +285,48 @@ def test_parse_timestamp_variants(text, expected):
 )
 def test_normalize_level(token, expected):
     assert normalize_level(token) == expected
+
+
+# --------------------------------------------------------------------------- #
+# Time zones
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("2026-09-12T18:00:25+02:00", timedelta(hours=2)),
+        ("2026-09-12T18:00:25-0530", timedelta(hours=-5, minutes=-30)),
+        ("2026-09-12T18:00:25Z", timedelta(0)),
+        ("2026-09-12 18:00:25,141", None),
+        ("09-17-2026 14:00:00:2", None),
+        ("", None),
+    ],
+)
+def test_timestamp_offset_is_read_off_the_line(text, expected):
+    assert timestamp_offset(text) == expected
+
+
+def test_a_shift_converts_entries_as_they_are_read(tmp_path):
+    path = tmp_path / "adaptiva.log"
+    path.write_text(
+        "2026-09-12 18:00:25,141 - INFO - one - Comp - TID=1, t\n"
+        "2026-09-12 18:05:00,000 - ERROR - two - Comp - TID=1, t\n",
+        encoding="utf-8",
+    )
+    shift = TimeShift(parse_zone("UTC"), parse_zone("+08:00"))
+    times = [entry.timestamp for entry in iter_entries(path, shift=shift)]
+    assert times == [datetime(2026, 9, 13, 2, 0, 25, 141000), datetime(2026, 9, 13, 2, 5)]
+    assert time_span(path, shift=shift) == (times[0], times[-1])
+    # Without a shift the file reads exactly as written.
+    assert [entry.timestamp for entry in iter_entries(path)] == [
+        datetime(2026, 9, 12, 18, 0, 25, 141000), datetime(2026, 9, 12, 18, 5)
+    ]
+
+
+def test_an_offset_written_on_the_line_beats_the_configured_zone(tmp_path):
+    path = tmp_path / "install.log"
+    path.write_text("2026-09-12T18:00:25+02:00 INFO setup started\n", encoding="utf-8")
+    [entry] = list(iter_entries(path, shift=TimeShift(parse_zone("UTC"), parse_zone("UTC"))))
+    assert entry.utc_offset == timedelta(hours=2)
+    assert entry.timestamp == datetime(2026, 9, 12, 16, 0, 25)

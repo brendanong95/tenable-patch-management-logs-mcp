@@ -1,0 +1,45 @@
+{
+  "_comment": [
+    "Copy to <data dir>/known_issues.json (data/known_issues.json by default), or point",
+    "TPM_KNOWLEDGE_FILE at it. Loaded on the next tool call after it changes; entries that are",
+    "rejected are listed with the reason by check_log_sources.",
+    "Required per issue: id, title, pattern (a regular expression, case-insensitive).",
+    "Optional: impact (high|medium|low|none - none means noise), category, explanation,",
+    "remediation, applies_to (client|server|both), confidence (site|documented|observed|generic),",
+    "source. Reusing a built-in id replaces that built-in issue."
+  ],
+  "known_issues": [
+    {
+      "id": "acme_proxy_407",
+      "title": "Proxy rejects client downloads (ticket OPS-4711)",
+      "pattern": "407 Proxy Authentication Required",
+      "impact": "high",
+      "category": "connectivity",
+      "explanation": "The corporate proxy asks TPM clients to authenticate, which they cannot do, so content downloads fail.",
+      "remediation": "Allow *.adaptiva.cloud and the CDN host through the proxy without authentication or inspection.",
+      "applies_to": "client",
+      "source": "https://acme.example/runbooks/OPS-4711"
+    },
+    {
+      "id": "acme_receipt_cleanup_chatter",
+      "title": "Receipt cleanup chatter we have agreed to ignore",
+      "pattern": "Could not find serverContentMetadataObject, while deleting receipts",
+      "impact": "none"
+    },
+    {
+      "id": "acme_maintenance_window_skip",
+      "title": "Patching skipped outside the change window",
+      "pattern": "outside of (the )?maintenance window",
+      "impact": "low",
+      "category": "patching",
+      "explanation": "Expected on servers whose change window is one hour a week; the deployment retries in the next window.",
+      "remediation": "Only investigate if the same device skips several windows in a row."
+    }
+  ],
+  "patch_deployment_results": {
+    "operation": { "1": "Install", "2": "Uninstall" },
+    "operation_status": { "1": "In progress", "2": "Succeeded", "3": "Failed" },
+    "reason_code": { "0": "No failure reason reported", "3010": "Success, reboot required" },
+    "reboot_required": { "true": "The device must reboot to finish the install" }
+  }
+}

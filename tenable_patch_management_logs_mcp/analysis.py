@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterator
 
-from . import classifier
+from . import classifier, customknowledge, history, timezones
 from .classifier import Event, classify, event_view, iso, redact, severity_rank
 from .error_codes import decode_any
 from .errors import InputError
@@ -29,7 +29,6 @@ from .knowledge import (
     LOG_ACQUISITION,
     LOG_CATALOG,
     PLAYBOOKS,
-    TIMESTAMP_NOTE,
     VERSION_ADVISORIES,
     Playbook,
 )
@@ -55,6 +54,15 @@ MAX_PATTERN_CHARS = 500
 MAX_TIMELINE_ROWS = 1_000
 MAX_TIMELINE_COLLECT = 100_000
 MAX_LISTED_FILES = 1_000
+#: What relative windows (24h, 7d) count back from.
+ANCHOR_NEWEST = "newest_entry"
+ANCHOR_NOW = "now"
+ANCHOR_EXPLICIT = "explicit"
+#: A device whose newest entry is this far behind the anchor is called out in results,
+#: or this fraction of the window length if that is longer.
+ANCHOR_LAG_MIN = timedelta(hours=1)
+ANCHOR_LAG_WINDOW_FRACTION = 0.5
+MAX_LAGGING_DEVICES = 10
 #: compare_devices: a signature counts as "much more frequent" at this ratio and count.
 COMPARE_RATIO = 3.0
 COMPARE_MIN_EVENTS = 5
@@ -87,17 +95,18 @@ class FileSpan:
     last: datetime | None
 
 
-_SPAN_CACHE: dict[tuple[str, int, float], FileSpan] = {}
+_SPAN_CACHE: dict[tuple[str, int, float, str], FileSpan] = {}
 _SPAN_CACHE_MAX = 20_000
 
 
 def file_span(log_file: LogFile) -> FileSpan:
-    key = (str(log_file.path), log_file.size, log_file.mtime)
+    # The zone conversion is part of the key: the same file can be read in two zones.
+    key = (str(log_file.path), log_file.size, log_file.mtime, log_file.shift.key)
     cached = _SPAN_CACHE.get(key)
     if cached is not None:
         return cached
     layout = sniff_layout(log_file.path)
-    first, last = time_span(log_file.path, layout)
+    first, last = time_span(log_file.path, layout, log_file.shift)
     span = FileSpan(layout, first, last)
     if len(_SPAN_CACHE) >= _SPAN_CACHE_MAX:
         _SPAN_CACHE.clear()
@@ -114,10 +123,44 @@ _RELATIVE = re.compile(
 )
 
 
+_ANCHOR_NEWEST_WORDS = frozenset({"", "newest", "newest_entry", "newest-entry", "log", "logs", "auto", "default"})
+_ANCHOR_NOW_WORDS = frozenset({"now", "clock", "wall_clock", "wall-clock", "today"})
+
+
+def parse_anchor_arg(
+    anchor: str | datetime | None, files: list[LogFile]
+) -> tuple[str, datetime | None]:
+    """Which clock relative windows count back from: the logs, this machine, or a time.
+
+    Returns ``(mode, fixed_time)``; ``fixed_time`` is ``None`` for the newest-entry mode,
+    where the time is only known once the file spans have been read.
+    """
+    if anchor is None:
+        return ANCHOR_NEWEST, None
+    if isinstance(anchor, datetime):
+        return ANCHOR_EXPLICIT, anchor.replace(tzinfo=None)
+    text = str(anchor).strip()
+    lowered = text.lower()
+    if lowered in _ANCHOR_NEWEST_WORDS:
+        return ANCHOR_NEWEST, None
+    if lowered in _ANCHOR_NOW_WORDS:
+        # "now" means now where the results are read, so use the display zone.
+        return ANCHOR_NOW, timezones.now_in_display(files).replace(microsecond=0)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise InputError(
+            f"anchor='{text}' is not a valid anchor.",
+            remediation="Use 'newest' (the newest entry in the selected logs, the default), 'now' (this "
+                        "machine's clock), or an ISO time such as 2026-09-17T08:00.",
+        ) from exc
+    return ANCHOR_EXPLICIT, parsed.replace(tzinfo=None)
+
+
 def parse_time_arg(
     value: str | datetime | None, anchor: Callable[[], datetime | None], name: str
 ) -> tuple[datetime | None, bool]:
-    """Parse an absolute ISO time or a relative span counted back from the newest entry."""
+    """Parse an absolute ISO time or a relative span counted back from the anchor."""
     if isinstance(value, datetime):
         return value.replace(tzinfo=None), False
     if value is None or not str(value).strip():
@@ -137,7 +180,8 @@ def parse_time_arg(
         if base is None:
             raise InputError(
                 f"{name}='{text}' is relative, but no timestamps were found in the selected logs to count back from.",
-                remediation="Use an absolute time such as 2026-09-17T08:00.",
+                remediation="Use an absolute time such as 2026-09-17T08:00, or anchor='now' to count back from "
+                            "this machine's clock.",
             )
         return base - delta, True
     try:
@@ -199,18 +243,57 @@ class Scope:
     end: datetime | None = None
     anchor: datetime | None = None
     relative: bool = False
+    anchor_mode: str = ANCHOR_NEWEST
 
     @property
     def windowed(self) -> bool:
         return self.start is not None or self.end is not None
 
     def window_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "from": iso(self.start),
             "to": iso(self.end) if self.end is not None else iso(self.anchor),
-            "to_is_newest_entry": self.end is None,
-            "relative_to_newest_entry": iso(self.anchor) if self.relative else None,
+            "to_is_newest_entry": self.end is None and self.anchor_mode == ANCHOR_NEWEST,
+            "relative_to_newest_entry": (
+                iso(self.anchor) if self.relative and self.anchor_mode == ANCHOR_NEWEST else None
+            ),
+            "anchor": {"mode": self.anchor_mode, "time": iso(self.anchor)},
         }
+        behind = self.devices_behind_anchor()
+        if behind:
+            data["devices_behind_anchor"] = behind
+            data["anchor_note"] = (
+                f"These devices' logs end before the window was measured from ({iso(self.anchor)}), so the "
+                "window covers less of their history - or none of it. Filter by device or source, or pass "
+                "an explicit since/until, to compare like with like."
+            )
+        return data
+
+    def devices_behind_anchor(self) -> list[dict[str, Any]]:
+        """Devices whose newest entry sits well behind the anchor a relative window used."""
+        if self.start is None or self.anchor is None:
+            return []
+        if not self.relative and self.anchor_mode == ANCHOR_NEWEST:
+            return []  # absolute window on the default anchor: nothing was measured from it
+        threshold = max(ANCHOR_LAG_MIN, (self.anchor - self.start) * ANCHOR_LAG_WINDOW_FRACTION)
+        newest: dict[str, datetime] = {}
+        for log_file in self.files:
+            last = file_span(log_file).last
+            if last is None:
+                continue
+            if log_file.device not in newest or last > newest[log_file.device]:
+                newest[log_file.device] = last
+        behind = [
+            {
+                "device": device,
+                "last_entry": iso(last),
+                "hours_behind_anchor": round((self.anchor - last).total_seconds() / 3600, 1),
+            }
+            for device, last in newest.items()
+            if self.anchor - last > threshold
+        ]
+        behind.sort(key=lambda row: -row["hours_behind_anchor"])
+        return behind[:MAX_LAGGING_DEVICES]
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -275,17 +358,22 @@ def build_scope(
     *,
     since: str | datetime | None = None,
     until: str | datetime | None = None,
+    anchor: str | datetime | None = None,
 ) -> Scope:
+    mode, fixed = parse_anchor_arg(anchor, files)
     cache: dict[str, datetime | None] = {}
 
-    def anchor() -> datetime | None:
+    def anchor_time() -> datetime | None:
         if "value" not in cache:
-            lasts = [file_span(f).last for f in files]
-            cache["value"] = max((stamp for stamp in lasts if stamp is not None), default=None)
+            if fixed is not None:
+                cache["value"] = fixed
+            else:
+                lasts = [file_span(f).last for f in files]
+                cache["value"] = max((stamp for stamp in lasts if stamp is not None), default=None)
         return cache["value"]
 
-    start, relative_start = parse_time_arg(since, anchor, "since")
-    end, relative_end = parse_time_arg(until, anchor, "until")
+    start, relative_start = parse_time_arg(since, anchor_time, "since")
+    end, relative_end = parse_time_arg(until, anchor_time, "until")
     if start is not None and end is not None and end < start:
         raise InputError("until is earlier than since.")
     return Scope(
@@ -293,8 +381,9 @@ def build_scope(
         files=files,
         start=start,
         end=end,
-        anchor=anchor(),
+        anchor=anchor_time(),
         relative=relative_start or relative_end,
+        anchor_mode=mode,
     )
 
 
@@ -307,9 +396,10 @@ def resolve_scope(
     files: str | list[str] | None = None,
     since: str | datetime | None = None,
     until: str | datetime | None = None,
+    anchor: str | datetime | None = None,
 ) -> Scope:
     sources, selected = select_files(registry, source=source, device=device, role=role, files=files)
-    return build_scope(sources, selected, since=since, until=until)
+    return build_scope(sources, selected, since=since, until=until, anchor=anchor)
 
 
 @dataclass
@@ -387,7 +477,7 @@ def scan(scope: Scope, coverage: Coverage) -> Iterator[tuple[LogFile, LogEntry]]
             coverage.unrecognised_format_files.append(log_file.rel)
         stop_after = scope.end + OUT_OF_ORDER_SLACK if scope.end is not None else None
         try:
-            for entry in iter_entries(log_file.path, span.layout):
+            for entry in iter_entries(log_file.path, span.layout, shift=log_file.shift):
                 coverage.entries_parsed += 1
                 if scope.windowed:
                     stamp = entry.timestamp
@@ -419,6 +509,12 @@ def to_event(log_file: LogFile, entry: LogEntry) -> Event:
 # --------------------------------------------------------------------------- #
 # Issue grouping (shared by summaries, playbooks and comparisons)
 # --------------------------------------------------------------------------- #
+
+
+def _issue_title(issue_id: str) -> str:
+    """Title for an issue id from either catalog; ids can come from a site file."""
+    issue = classifier.known_issue_by_id(issue_id)
+    return issue.title if issue is not None else issue_id
 
 
 def _known_brief(known: Any) -> dict[str, Any] | None:
@@ -585,7 +681,7 @@ class IssueGroups:
 
     def noise_summary(self) -> list[dict[str, Any]]:
         return [
-            {"known_issue": issue_id, "title": KNOWN_ISSUES_BY_ID[issue_id].title, "count": count}
+            {"known_issue": issue_id, "title": _issue_title(issue_id), "count": count}
             for issue_id, count in self.noise.most_common(10)
         ]
 
@@ -601,6 +697,7 @@ def summarize_errors(
     source: str | None = None,
     since: str | None = DEFAULT_SUMMARY_WINDOW,
     until: str | None = None,
+    anchor: str | None = None,
     min_severity: str = "WARN",
     device: str | None = None,
     role: str | None = None,
@@ -610,7 +707,8 @@ def summarize_errors(
 ) -> dict[str, Any]:
     floor = _severity_arg(min_severity)
     top = _clamp(top, 1, MAX_ISSUES, "top")
-    scope = resolve_scope(registry, source=source, device=device, role=role, files=files, since=since, until=until)
+    scope = resolve_scope(registry, source=source, device=device, role=role, files=files, since=since,
+                          until=until, anchor=anchor)
     coverage = Coverage()
     groups = IssueGroups()
     for log_file, entry in scan(scope, coverage):
@@ -642,7 +740,7 @@ def summarize_errors(
         "top_logs": [{"log": log, "count": n} for log, n in groups.by_log.most_common(10)],
         "coverage": coverage.to_dict(),
         "limits": limits_snapshot(),
-        "timestamps_note": TIMESTAMP_NOTE,
+        "timestamps_note": timezones.timestamp_note(scope.files),
     }
 
 
@@ -670,6 +768,7 @@ def search_logs(
     source: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    anchor: str | None = None,
     min_severity: str | None = None,
     device: str | None = None,
     role: str | None = None,
@@ -699,7 +798,8 @@ def search_logs(
     offset = _clamp(offset, 0, MAX_SEARCH_COLLECT, "offset")
     wanted_component = component.strip().lower() if component else None
 
-    scope = resolve_scope(registry, source=source, device=device, role=role, files=files, since=since, until=until)
+    scope = resolve_scope(registry, source=source, device=device, role=role, files=files, since=since,
+                          until=until, anchor=anchor)
     coverage = Coverage()
     records: list[dict[str, Any]] = []
     by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -777,7 +877,7 @@ def search_logs(
         "collection_capped": capped,
         "matches": matches,
         "coverage": coverage.to_dict(),
-        "timestamps_note": TIMESTAMP_NOTE,
+        "timestamps_note": timezones.timestamp_note(scope.files),
     }
 
 
@@ -792,6 +892,7 @@ def build_timeline(
     source: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    anchor: str | None = None,
     around: str | None = None,
     minutes_before: int = 15,
     minutes_after: int = 15,
@@ -810,7 +911,7 @@ def build_timeline(
     if around:
         before_minutes = _clamp(minutes_before, 0, 7 * 24 * 60, "minutes_before")
         after_minutes = _clamp(minutes_after, 0, 7 * 24 * 60, "minutes_after")
-        probe = build_scope(sources, selected, since=around)
+        probe = build_scope(sources, selected, since=around, anchor=anchor)
         if probe.start is None:
             raise InputError("around is not a valid time.")
         scope = build_scope(
@@ -818,11 +919,12 @@ def build_timeline(
             selected,
             since=probe.start - timedelta(minutes=before_minutes),
             until=probe.start + timedelta(minutes=after_minutes),
+            anchor=anchor,
         )
         scope.relative = probe.relative
     else:
         scope = build_scope(
-            sources, selected, since=since if since or until else DEFAULT_TIMELINE_WINDOW, until=until
+            sources, selected, since=since if since or until else DEFAULT_TIMELINE_WINDOW, until=until, anchor=anchor
         )
     needle = keyword.lower() if keyword else None
     coverage = Coverage()
@@ -911,7 +1013,7 @@ def build_timeline(
         "collection_capped": capped,
         "rows": collapsed,
         "coverage": coverage.to_dict(),
-        "timestamps_note": TIMESTAMP_NOTE,
+        "timestamps_note": timezones.timestamp_note(scope.files),
     }
 
 
@@ -978,6 +1080,7 @@ def diagnose(
     source: str | None = None,
     since: str | None = DEFAULT_SUMMARY_WINDOW,
     until: str | None = None,
+    anchor: str | None = None,
     device: str | None = None,
 ) -> dict[str, Any]:
     key = (symptom or "").strip().lower()
@@ -996,7 +1099,7 @@ def diagnose(
             "missing_logs": missing,
             "advice": playbook.advice,
         }
-    scope = build_scope(sources, chosen, since=since, until=until)
+    scope = build_scope(sources, chosen, since=since, until=until, anchor=anchor)
     run = _Diagnosis(playbook, scope)
     handler = _HANDLERS.get(playbook.id)
     coverage = Coverage()
@@ -1041,7 +1144,7 @@ def diagnose(
         "missing_logs": missing,
         "advice": playbook.advice,
         "coverage": coverage.to_dict(),
-        "timestamps_note": TIMESTAMP_NOTE,
+        "timestamps_note": timezones.timestamp_note(scope.files),
     }
 
 
@@ -1135,6 +1238,18 @@ def _handle_patch(run: _Diagnosis, log_file: LogFile, entry: LogEntry, event: Ev
                     bucket["latest_at"] = f"{log_file.rel}:{entry.line}"
 
 
+def _patch_result_note() -> str:
+    """Whether the undocumented PatchDeploymentResult values could be decoded here."""
+    mapped = customknowledge.active().deployment_results
+    base = ("PatchDeploymentResult status and reason values are shown as logged; Tenable does not document "
+            "their meanings, so failure evidence is based on reason codes and exceptions.")
+    if not mapped:
+        return base + (" Add patch_deployment_results to a site knowledge file to have the values you know "
+                       "decoded here.")
+    return base + (" Values covered by your site knowledge file are decoded alongside them ("
+                   + ", ".join(f"{name}: {len(values)}" for name, values in sorted(mapped.items())) + " mapped).")
+
+
 def _finish_patch(run: _Diagnosis, rolled: list[dict[str, Any]]) -> str:
     results = list(run.details.pop("_results", {}).values())
     for result in results:
@@ -1153,8 +1268,7 @@ def _finish_patch(run: _Diagnosis, rolled: list[dict[str, Any]]) -> str:
                  "first_seen": iso(b["first"]), "last_seen": iso(b["last"])}
                 for b in codes[:10]
             ],
-            "note": "PatchDeploymentResult status and reason values are shown as logged; Tenable does not "
-                    "document their meanings, so failure evidence is based on reason codes and exceptions.",
+            "note": _patch_result_note(),
         }
     )
     significant, _ = _significant(rolled)
@@ -1553,6 +1667,7 @@ def compare_devices(
     source: str | None = None,
     since: str | None = DEFAULT_SUMMARY_WINDOW,
     until: str | None = None,
+    anchor: str | None = None,
     min_severity: str = "WARN",
     include_noise: bool = False,
     top: int = 25,
@@ -1576,7 +1691,7 @@ def compare_devices(
     if healthy == problem:
         raise InputError("healthy_device and problem_device are the same device.")
     files = [f for f in all_files if f.device in (healthy, problem)]
-    scope = build_scope(sources, files, since=since, until=until)
+    scope = build_scope(sources, files, since=since, until=until, anchor=anchor)
     coverage = Coverage()
     per_device = {healthy: IssueGroups(), problem: IssueGroups()}
     for log_file, entry in scan(scope, coverage):
@@ -1622,7 +1737,7 @@ def compare_devices(
         "more_frequent_on_problem_device": more_on_problem[:top],
         "thresholds": {"ratio": COMPARE_RATIO, "min_events": COMPARE_MIN_EVENTS},
         "coverage": coverage.to_dict(),
-        "timestamps_note": TIMESTAMP_NOTE,
+        "timestamps_note": timezones.timestamp_note(scope.files),
     }
 
 
@@ -1638,6 +1753,9 @@ def check_sources(registry: SourceRegistry) -> dict[str, Any]:
         "auto_discover": registry.auto_discover_enabled(),
         "deployment_setting": registry.global_deployment_hint(),
         "env_sources_configured": bool((registry.env.get("TPM_LOG_SOURCES") or "").strip()),
+        "time_zones": registry.timezones.to_dict(),
+        "site_knowledge": customknowledge.active(registry.env).to_dict(),
+        "baseline_history": history.BaselineStore(registry.data_dir).stats(),
     }
     if not sources:
         return {
@@ -1650,6 +1768,7 @@ def check_sources(registry: SourceRegistry) -> dict[str, Any]:
         }
     report = []
     total_files = 0
+    all_files: list[LogFile] = []
     all_roles: set[str] = set()
     deployments: set[str] = set()
     for source in sources:
@@ -1660,6 +1779,7 @@ def check_sources(registry: SourceRegistry) -> dict[str, Any]:
             continue
         files = registry.files(source)
         total_files += len(files)
+        all_files.extend(files)
         devices: dict[str, dict[str, Any]] = {}
         unrecognised = []
         for log_file in files:
@@ -1726,7 +1846,7 @@ def check_sources(registry: SourceRegistry) -> dict[str, Any]:
         "sources": report,
         "guidance": guidance,
         "configuration": configuration,
-        "timestamps_note": TIMESTAMP_NOTE,
+        "timestamps_note": timezones.timestamp_note(all_files),
     }
 
 
@@ -1766,12 +1886,14 @@ def list_log_files(
 
 
 def explain(topic: str | None = None) -> dict[str, Any]:
+    custom = customknowledge.active()
     if not topic or not topic.strip():
         return {
             "ok": True,
             "type": "index",
             "symptoms": {pid: pb.title for pid, pb in PLAYBOOKS.items()},
-            "known_issues": {issue.id: issue.title for issue in KNOWN_ISSUES},
+            "known_issues": {issue.id: issue.title for issue in (*custom.issues, *KNOWN_ISSUES)},
+            "site_known_issues": [issue.id for issue in custom.issues],
             "logs": sorted(info.name for info in LOG_CATALOG.values()),
             "usage": "Pass a log file name, an error code (0x80070643, -2147467259, 1603, http 407), a symptom id "
                      "or a known issue id.",
@@ -1780,6 +1902,9 @@ def explain(topic: str | None = None) -> dict[str, Any]:
     lower = text.lower()
     if lower in PLAYBOOKS:
         return {"ok": True, "type": "symptom", **PLAYBOOKS[lower].to_dict()}
+    site_issue = custom.issue_by_id(lower)
+    if site_issue is not None:
+        return {"ok": True, "type": "known_issue", "from_site_knowledge_file": True, **site_issue.to_dict()}
     if lower in KNOWN_ISSUES_BY_ID:
         return {"ok": True, "type": "known_issue", **KNOWN_ISSUES_BY_ID[lower].to_dict()}
     filename = re.split(r"[\\/]", text)[-1]
@@ -1799,7 +1924,9 @@ def explain(topic: str | None = None) -> dict[str, Any]:
         return {"ok": True, "type": "error_code", **code.to_dict()}
     logs = [i.to_dict() for i in LOG_CATALOG.values() if lower in i.name.lower() or lower in (i.purpose() or "").lower()]
     issues = [
-        {"id": i.id, "title": i.title} for i in KNOWN_ISSUES if lower in i.title.lower() or lower in i.explanation.lower()
+        {"id": i.id, "title": i.title}
+        for i in (*custom.issues, *KNOWN_ISSUES)
+        if lower in i.title.lower() or lower in i.explanation.lower()
     ]
     symptoms = [
         {"id": p.id, "title": p.title} for p in PLAYBOOKS.values() if lower in p.title.lower() or lower in p.summary.lower()

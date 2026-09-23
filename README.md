@@ -26,12 +26,15 @@ reasoning) instead of piles of raw lines for the model to add up.
 | `detect_log_anomalies` | A recent window compared with the days before it: new error signatures, error spikes, restart loops, logs that went quiet. |
 | `list_log_files` | Files with device, role, purpose, size and time span. |
 | `explain` | What a log file records, what an error code means (`0x80070643`, `1603`, `http 407`), or what a symptom / known issue covers. |
+| `record_baseline_snapshot` | Save today's per-day error counts so `detect_log_anomalies` still has a baseline after TPM rotates the logs away. The only tool that writes anything. |
 | `add_log_source` / `remove_log_source` | Register a folder, UNC path, single log file, `.zip` or `.tar.gz`; remembered between sessions. |
 
 Safety properties worth knowing:
 
-- **Read-only.** Sources are never modified. The only writes are `data/sources.json` (sources added
-  with `add_log_source`) and an extracted copy of each bundle under `data/bundles`.
+- **Read-only.** Sources are never modified. Every write stays in the data dir: `data/sources.json`
+  (sources added with `add_log_source`), an extracted copy of each bundle under `data/bundles`, and
+  `data/baselines.db` when you call `record_baseline_snapshot` - which stores device names,
+  components, normalised signatures, days and counts, never message text.
 - **Nothing that looks like a credential is returned.** TPM writes the Tenable VM access key into
   `VulnerabilityManagement.log` and `adaptiva.err` in plain text; 64-hex key material, `token:` /
   `password=` / `secretKey=` values, bearer tokens and URL passwords are masked to their last 4
@@ -81,7 +84,10 @@ cp .env.example .env
 | `TPM_LOG_SOURCES` | `name=path;name2=path2` - folders, UNC paths, log files, `.zip` / `.tar.gz` bundles. |
 | `TPM_DEPLOYMENT` | `saas`, `onprem` or `auto` (default: inferred per source). |
 | `TPM_AUTO_DISCOVER` | Also use TPM installed on this machine (`%ADAPTIVASERVER%`, `%ADAPTIVACLIENT%`, `%windir%\AdaptivaSetupLogs`, `/opt/tenable/patchclient/logs`). Default `true`. |
-| `TPM_MCP_DATA_DIR` | Where runtime sources and extracted bundles live. Default `./data`. |
+| `TPM_MCP_DATA_DIR` | Where runtime sources, extracted bundles and recorded baselines live. Default `./data`. |
+| `TPM_LOG_TIMEZONES` | `name=zone;name2=zone` - the zone each source or device writes its logs in (`UTC`, `Asia/Singapore`, `+08:00`, `local`, `*` for the rest). |
+| `TPM_DISPLAY_TIMEZONE` | The zone every result is shown in. Defaults to `UTC` once any log zone is set; unset means no conversion at all. |
+| `TPM_KNOWLEDGE_FILE` | Your own known issues and `PatchDeploymentResult` meanings (a `.json`/`.yaml` file, a folder, or several separated by `;`). Default: `known_issues.json` in the data dir. |
 
 Sources can also be added in conversation with `add_log_source`, which is usually easier for
 support bundles.
@@ -166,6 +172,8 @@ project-level `.mcp.json`.
 - *"What does WS-BAD07 have that WS-GOOD01 doesn't?"*
 - *"Anything new or spiking in the last 24 hours compared with the week before?"*
 - *"Which clients is the server retrying messages to?"*
+- *"The server logs in UTC and these clients in Singapore time - line them up and show me the timeline."*
+- *"Record a baseline snapshot now, so next week's comparison still has this week."*
 
 ## How the analysis works
 
@@ -224,25 +232,105 @@ result:
 | `SILENT_LOG_MIN_BASELINE_EVENTS` | `50` | Baseline entries a log needs before going quiet is notable |
 
 Each finding is judged against the log(s) it appears in. A log that only started recently is not
-reported as a spike just because the device's other logs go back further.
+reported as a spike just because the device's other logs go back further. Days that have rotated
+away are filled in from recorded snapshots when there are any (see
+[Baselines that survive rotation](#baselines-that-survive-rotation)); every result says how many
+days came from the logs and how many from the store.
 
 **Time.** Relative windows (`90m`, `24h`, `7d`, `2w`) count back from the **newest entry in the
-selected logs**, not from now, so an old support bundle still gives sensible results. Timestamps
-are shown as written. TPM 10.2 SaaS server logs and Windows client logs were observed to be in UTC.
+selected logs**, not from now, so an old support bundle still gives sensible results. Pass
+`anchor="now"` to measure from this machine's clock instead, or an ISO time to measure from a
+moment. Whatever the anchor, any device whose logs end well before it is listed in
+`devices_behind_anchor` with how far behind it is, so a quiet device is never mistaken for a healthy
+one. Timestamps are shown as written unless zones are configured (see [Time zones](#time-zones));
+TPM 10.2 SaaS server logs and Windows client logs were observed to be in UTC.
+
+## Fitting it to your environment
+
+### Time zones
+
+TPM timestamps carry no zone, so a server logging in UTC and a client logging in Asia/Singapore sit
+eight hours apart in a merged timeline. Declare what each one writes and everything is converted
+into a single display zone before any window, timeline or comparison is worked out:
+
+```bash
+TPM_LOG_TIMEZONES=saas-server=UTC;WS-BAD07=Asia/Singapore;*=UTC
+TPM_DISPLAY_TIMEZONE=Asia/Singapore
+```
+
+Keys match a source name first, then a device name, then `*`. Values are IANA names, fixed offsets
+(`+08:00`), `UTC` or `local` (this machine). `add_log_source(..., timezone="+08:00")` sets it for one
+source. Every result says what was converted, and names any device left as written - nothing shifts
+silently. Lines that carry their own offset (`2026-09-10T08:15:02+0800`) are converted from that
+offset whatever the configuration says. Without configuration nothing is converted, exactly as
+before.
+
+### Your own known issues
+
+The built-in catalog cannot know your environment. A knowledge file adds signatures, marks noise you
+have already decided to ignore, and decodes the `PatchDeploymentResult` numbers Tenable does not
+document - no code change, picked up on the next call:
+
+```json
+{
+  "known_issues": [
+    {
+      "id": "acme_proxy_407",
+      "title": "Proxy rejects client downloads (ticket OPS-4711)",
+      "pattern": "407 Proxy Authentication Required",
+      "impact": "high",
+      "explanation": "Our proxy asks TPM clients to authenticate, which they cannot do.",
+      "remediation": "Allow *.adaptiva.cloud through the proxy without inspection."
+    },
+    { "id": "acme_chatter", "title": "Cleanup message we ignore", "pattern": "receipts.*no in-memory cleanup", "impact": "none" }
+  ],
+  "patch_deployment_results": {
+    "operation_status": { "3": "Failed" },
+    "reason_code": { "3010": "Success, reboot required" }
+  }
+}
+```
+
+Only `id`, `title` and `pattern` are required; `impact: none` marks noise. Entries are matched before
+the built-in ones, so reusing a built-in id replaces it. Rejected entries are listed with the reason
+by `check_log_sources` - a knowledge file never fails silently. See
+[`examples/known_issues.example.json`](examples/known_issues.example.json).
+
+### Baselines that survive rotation
+
+`detect_log_anomalies` compares a window with the days before it *in the same logs*, so a heavily
+rotated log gives it a short baseline (findings then carry `low_confidence`). Recording a snapshot
+keeps the daily counts after the file they came from is gone:
+
+```bash
+# after each collection, or on a schedule against a live log folder
+uv run python -c "from tenable_patch_management_logs_mcp import anomaly, sources; \
+print(anomaly.record_baseline_snapshot(sources.SourceRegistry(), since='30d')['message'])"
+```
+
+Each device is then asked only for the days its own logs no longer reach, so nothing is counted
+twice, and `baseline_history` in every result says which days came from where. Re-recording a day
+keeps the larger count, so running it twice cannot inflate a baseline. Deleting `data/baselines.db`
+deletes the history.
 
 ## Layout
 
 ```
 tenable_patch_management_logs_mcp/
   __main__.py      python -m tenable_patch_management_logs_mcp
-  server.py        MCP entrypoint and the eleven tool definitions
+  server.py        MCP entrypoint and the twelve tool definitions
   sources.py       Source configuration, bundle extraction, device / role / rotation detection
   logformat.py     Line layouts, multi-line entries, encodings, time spans
   classifier.py    Redaction, signatures, severity, known-issue matching, extractions
   error_codes.py   Win32 / MSI / HRESULT / Windows Update / CBS / HTTP code decoding
   knowledge.py     Log catalog, known issues, playbooks, version advisories, where to get logs
+  customknowledge.py  Your own known issues and PatchDeploymentResult meanings, loaded from a file
+  timezones.py     Which zone each log is written in, and the zone results are shown in
+  history.py       Recorded daily baselines (SQLite), so anomalies survive log rotation
   analysis.py      Scoped, bounded scanning; summaries, search, timelines, playbooks, comparisons
-  anomaly.py       Window-versus-baseline findings and thresholds
+  anomaly.py       Window-versus-baseline findings, thresholds and snapshot recording
+examples/
+  known_issues.example.json   Starting point for your own known issues and value mappings
 collect/
   Collect-TPMLogs.ps1    Windows collector (local or WinRM), one folder per device
   collect-tpm-logs.sh    Linux / macOS collector
@@ -254,7 +342,7 @@ tests/
   test_*.py
 ```
 
-Dependency direction is one-way: `server → {analysis, anomaly} → {classifier, sources} → {logformat, error_codes, knowledge}`.
+Dependency direction is one-way: `server → {analysis, anomaly} → {classifier, sources, history} → {logformat, error_codes, knowledge, customknowledge, timezones}`.
 
 ## Testing
 
@@ -264,9 +352,10 @@ Dependency direction is one-way: `server → {analysis, anomaly} → {classifier
 uv run pytest -q
 ```
 
-162 tests covering every layout, rotation and encoding, bundle extraction guards, device/role
-detection, redaction, signatures, severity escalation, known issues, every playbook, anomaly
-thresholds and the tool contracts. All fixtures are synthetic (`tests/sample_logs.py`); no real log
+232 tests covering every layout, rotation and encoding, bundle extraction guards, device/role
+detection, redaction, signatures, severity escalation, known issues, site knowledge files, zone
+conversion, window anchoring, recorded baselines, every playbook, anomaly thresholds and the tool
+contracts. All fixtures are synthetic (`tests/sample_logs.py`); no real log
 content is stored in the repository.
 
 ### 2. Offline end-to-end
@@ -286,9 +375,10 @@ error. Exits non-zero on any failure, so it works as a CI gate.
 uv run python scripts/live_check.py 7d
 ```
 
-Uses the same configuration as the server and prints sources, the error summary, the playbooks
-relevant to the logs you have, and anomalies. On the real 80 MB SaaS bundle every call finished in
-under 5 seconds.
+Uses the same configuration as the server and prints sources, the zone / knowledge / baseline
+configuration in force, the error summary, the playbooks relevant to the logs you have, and
+anomalies. On a real 80 MB SaaS bundle a 7-day summary took about 4 seconds, an unfiltered search
+about 6, and the slowest call measured - a 30-day summary across every file - about 9.
 
 ### 4. Through an MCP client
 
@@ -302,22 +392,25 @@ Or connect Claude Desktop / Claude Code (above) and ask one of the example quest
 
 - **Formats validated on 10.2.973.9 SaaS server logs and a Windows client `adaptiva.log`.** On-prem
   server logs use the same Java logging and are expected to match, but have not been checked
-  against a real on-prem bundle. The same applies to Linux and macOS client logs. `check_log_sources`
-  lists any file whose format was not recognised.
+  against a real on-prem bundle. The same applies to Linux and macOS client logs.
+  `check_log_sources` lists any file whose format was not recognised.
 - **Client component logs were not in the real samples.** The playbooks for `_SDMErrors.log`,
   `SoftwareInstaller.log` and `WindowsPatching.log` rely on exit codes, HRESULTs, exceptions and the
-  documented `PatchDeploymentResult` line rather than exact message wording. Add real patterns to
-  `KNOWN_ISSUES` as you meet them.
-- **`PatchDeploymentResult` status and reason values are undocumented.** They are shown as logged;
-  failure evidence comes from non-zero reason codes and exceptions.
-- **Timestamps are not converted between time zones.** Mixing logs from machines that log in
-  different zones shifts them relative to each other in timelines.
-- **Relative windows follow the newest entry in the selected logs.** Filter to one source or device
-  when their logs end at very different times.
-- **Anomaly detection only sees what the logs still contain.** Heavily rotated logs give short
-  baselines; findings then carry `low_confidence`.
-- **The knowledge base is a starting point.** Known issues marked `observed` come from one tenant's
-  logs; confirm fixes against current Tenable documentation.
+  documented `PatchDeploymentResult` line rather than exact message wording. Add the wording you
+  meet to your own knowledge file; no code change is needed.
+- **`PatchDeploymentResult` status and reason values are undocumented.** They are shown as logged,
+  and failure evidence comes from non-zero reason codes and exceptions. Map the values your console
+  shows under `patch_deployment_results` and they are decoded alongside them.
+- **Time zones have to be declared.** TPM writes local timestamps with no zone, so no tool can
+  detect one: set `TPM_LOG_TIMEZONES` (or `timezone` on `add_log_source`) when logs come from
+  machines in different zones. Anything without a declared zone is shown as written and named in the
+  results rather than guessed at.
+- **Recorded baselines start when you start recording.** `record_baseline_snapshot` cannot recover
+  days that rotated away before its first run, and it keeps counts per day, so a burst inside one
+  day is judged against that whole day.
+- **The knowledge base is a starting point.** Built-in issues marked `observed` come from one
+  tenant's logs; confirm fixes against current Tenable documentation, and put what your own
+  environment keeps seeing into a knowledge file.
 
 ## Disclaimer
 

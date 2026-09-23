@@ -32,6 +32,7 @@ from typing import Any, Iterable, Mapping
 
 from .errors import InputError, NoSourcesError, SourceError
 from .knowledge import CLIENT_ONLY_LOGS, LOG_CATALOG, LOG_ACQUISITION, SERVER_ONLY_LOGS, SETUP_LOGS
+from .timezones import IDENTITY, TimeShift, TimeZoneConfig, parse_zone
 
 # --------------------------------------------------------------------------- #
 # Tunable constants
@@ -111,6 +112,8 @@ class Source:
     root: Path | None = None
     single_file: Path | None = None
     error: str | None = None
+    #: Zone these logs are written in ("UTC", "Asia/Singapore", "+08:00", "local").
+    timezone: str | None = None
 
     @property
     def available(self) -> bool:
@@ -126,6 +129,7 @@ class Source:
             "added_at": self.added_at,
             "available": self.available,
             "error": self.error,
+            "timezone": self.timezone,
         }
 
 
@@ -142,6 +146,8 @@ class LogFile:
     size: int
     mtime: float
     client_id: str | None = None
+    #: Conversion applied to this file's timestamps; identity unless zones are configured.
+    shift: TimeShift = IDENTITY
 
     @property
     def compressed(self) -> bool:
@@ -149,7 +155,7 @@ class LogFile:
 
     def to_dict(self) -> dict[str, Any]:
         info = LOG_CATALOG.get(self.log_key)
-        return {
+        data = {
             "source": self.source,
             "file": self.rel,
             "device": self.device,
@@ -160,6 +166,9 @@ class LogFile:
             "modified": datetime.fromtimestamp(self.mtime).isoformat(sep=" ", timespec="seconds"),
             "purpose": info.purpose(self.role) if info else None,
         }
+        if self.shift.shown_in is not None:
+            data["timezone"] = self.shift.to_dict()
+        return data
 
 
 @dataclass
@@ -402,6 +411,7 @@ class SourceRegistry:
         self.env = os.environ if env is None else env
         self.data_dir = data_dir or default_data_dir(self.env)
         self._facts_cache: dict[tuple[str, int, int], FileFacts] = {}
+        self._timezones: TimeZoneConfig | None = None
 
     # -- configuration --------------------------------------------------------- #
 
@@ -412,6 +422,13 @@ class SourceRegistry:
     @property
     def bundles_dir(self) -> Path:
         return self.data_dir / BUNDLES_DIRNAME
+
+    @property
+    def timezones(self) -> TimeZoneConfig:
+        """Zone configuration (TPM_LOG_TIMEZONES / TPM_DISPLAY_TIMEZONE), read once."""
+        if self._timezones is None:
+            self._timezones = TimeZoneConfig.from_env(self.env)
+        return self._timezones
 
     def global_deployment_hint(self) -> str:
         value = (self.env.get("TPM_DEPLOYMENT") or DEPLOYMENT_AUTO).strip().lower()
@@ -452,6 +469,7 @@ class SourceRegistry:
                         origin="runtime",
                         deployment_hint=str(record.get("deployment") or DEPLOYMENT_AUTO),
                         added_at=record.get("added_at"),
+                        timezone=str(record["timezone"]) if record.get("timezone") else None,
                     )
                 )
         return sources
@@ -571,10 +589,13 @@ class SourceRegistry:
 
     # -- runtime management ---------------------------------------------------------- #
 
-    def add(self, name: str, path: str, deployment: str = DEPLOYMENT_AUTO) -> Source:
+    def add(self, name: str, path: str, deployment: str = DEPLOYMENT_AUTO,
+            timezone: str | None = None) -> Source:
         name = (name or "").strip()
         path = (path or "").strip().strip('"')
         deployment = (deployment or DEPLOYMENT_AUTO).strip().lower()
+        timezone = (timezone or "").strip() or None
+        parse_zone(timezone, name="timezone")  # raises InputError on an unusable zone
         if not _NAME_PATTERN.match(name):
             raise InputError(
                 f"Invalid source name '{name}'.",
@@ -592,11 +613,12 @@ class SourceRegistry:
                 remediation="Choose a different name.",
             )
         source = self._resolve(Source(name=name, path=path, origin="runtime", deployment_hint=deployment,
-                                      added_at=_utc_now_iso()))
+                                      added_at=_utc_now_iso(), timezone=timezone))
         if not source.available:
             raise SourceError(f"Cannot use '{path}': {source.error}")
         records = [r for r in self._read_records() if str(r.get("name", "")).lower() != name.lower()]
-        records.append({"name": name, "path": path, "deployment": deployment, "added_at": source.added_at})
+        records.append({"name": name, "path": path, "deployment": deployment, "added_at": source.added_at,
+                        "timezone": timezone})
         self._write_records(records)
         return source
 
@@ -648,10 +670,12 @@ class SourceRegistry:
             return []
         if source.kind == KIND_FILE and source.single_file is not None:
             path = source.single_file
-            return [
+            single = [
                 self._log_file(source, path, parts=[], context=list(path.parent.parts),
                                fallback=self._fallback_device(source, []), rel=path.name)
             ]
+            self._apply_timezones(source, single)
+            return single
 
         if source.kind == KIND_BUNDLE:
             root, wrappers = _descend_wrappers(source.root)
@@ -678,8 +702,23 @@ class SourceRegistry:
                 break
         _propagate_devices(results, fallback)
         _propagate_roles(results)
+        self._apply_timezones(source, results)
         results.sort(key=lambda f: (f.device.lower(), f.role, f.log_key, f.rotation, f.rel.lower()))
         return results
+
+    def _apply_timezones(self, source: Source, files: list[LogFile]) -> None:
+        """Attach each file's zone conversion, once the devices are known."""
+        config = self.timezones
+        if config.display is None:
+            return
+        cache: dict[str, TimeShift] = {}
+        for log_file in files:
+            shift = cache.get(log_file.device)
+            if shift is None:
+                shift = cache[log_file.device] = config.shift_for(
+                    source=source.name, device=log_file.device, source_zone=source.timezone
+                )
+            log_file.shift = shift
 
     def _fallback_device(self, source: Source, wrappers: list[str]) -> str:
         if source.kind == KIND_BUNDLE:

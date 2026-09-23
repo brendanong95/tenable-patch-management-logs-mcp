@@ -7,6 +7,9 @@ bundle in the data folder.
     uv run python scripts/live_check.py [window]
 
 ``window`` defaults to 7d (relative to the newest log entry).
+
+It also prints the zone, site-knowledge and recorded-baseline configuration in force,
+so a misconfigured zone or knowledge file shows up before you trust the numbers.
 """
 
 from __future__ import annotations
@@ -51,6 +54,18 @@ for source in sources["sources"]:
         print(f"    - {device['device']} {device['roles']} {device['first_entry']} -> {device['last_entry']}")
 for item in sources.get("guidance", []):
     print("  guidance:", item)
+config = sources.get("configuration", {})
+zones = config.get("time_zones", {})
+print(f"  time zones: display={zones.get('display_timezone') or 'as written'} {zones.get('log_timezones') or ''}")
+for problem in zones.get("problems", []):
+    print("    problem:", problem)
+site = config.get("site_knowledge", {})
+print(f"  site knowledge: {site.get('known_issues_loaded', 0)} issue(s) from {len(site.get('files', []))} file(s)")
+for problem in site.get("problems", []):
+    print("    problem:", problem)
+store = config.get("baseline_history", {})
+print("  recorded baselines:", f"{store.get('days_recorded')} day(s) {store.get('first_day')} -> {store.get('last_day')}"
+      if store.get("recorded") else "none (record_baseline_snapshot keeps one after the logs rotate)")
 
 summary = timed(f"summarize_errors (since {WINDOW})", lambda: server.summarize_errors(since=WINDOW, top=15))
 if summary.get("ok"):
@@ -74,5 +89,7 @@ for symptom in symptoms:
 anomalies = timed("detect_log_anomalies (last 24h vs 7 days)", lambda: server.detect_log_anomalies(since="24h"))
 for finding in anomalies.get("findings", [])[:10]:
     print(f"  [{finding['severity']}] {finding['type']}: {finding['reasoning'][:200]}")
+if anomalies.get("ok"):
+    print("  baseline history:", anomalies["baseline_history"]["note"])
 
 print("\nLive check complete.")

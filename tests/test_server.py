@@ -25,7 +25,7 @@ def wired(registry, monkeypatch):
 
 def test_all_tools_are_registered_with_annotations():
     tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
-    assert set(tools) == READ_ONLY_TOOLS | {"add_log_source", "remove_log_source"}
+    assert set(tools) == READ_ONLY_TOOLS | {"add_log_source", "remove_log_source", "record_baseline_snapshot"}
     for name, tool in tools.items():
         hints = tool.model_dump(exclude_none=True).get("annotations") or {}
         read_only = hints.get("read_only_hint", hints.get("readOnlyHint"))
@@ -83,6 +83,31 @@ def test_add_and_remove_source_through_the_tools(tmp_path, sample_tree, monkeypa
     assert missing["ok"] is False and missing["error"] == "source_error"
     assert server.remove_log_source("case")["ok"] is True
     assert server.remove_log_source("case")["ok"] is False
+
+
+def test_recording_a_snapshot_writes_a_store_beside_the_other_data(wired):
+    result = server.record_baseline_snapshot(since="7d")
+    assert result["ok"] is True
+    assert result["signature_days_written"] > 0
+    assert result["store"].endswith("baselines.db")
+    assert result["store_state"]["recorded"] is True
+    assert "Delete that file" in result["privacy_note"]
+    # The store is then reported by check_log_sources and used by the anomaly tool.
+    assert server.check_log_sources()["configuration"]["baseline_history"]["recorded"] is True
+    assert server.detect_log_anomalies()["ok"] is True
+
+
+def test_a_source_can_declare_the_zone_its_logs_are_written_in(tmp_path, sample_tree, monkeypatch):
+    monkeypatch.setattr(
+        server, "_registry",
+        SourceRegistry(data_dir=tmp_path / "d",
+                       env={"TPM_AUTO_DISCOVER": "false", "TPM_DISPLAY_TIMEZONE": "UTC"}),
+    )
+    added = server.add_log_source("clients", str(sample_tree["clients_dir"]), timezone="+08:00")
+    assert added["ok"] is True and added["source"]["timezone"] == "+08:00"
+    assert "Times are shown in UTC" in server.summarize_errors(since="7d")["timestamps_note"]
+    rejected = server.add_log_source("other", str(sample_tree["clients_dir"]), timezone="Mars/Olympus")
+    assert rejected["ok"] is False and rejected["error"] == "invalid_input"
 
 
 def test_unexpected_exceptions_do_not_escape(wired, monkeypatch):

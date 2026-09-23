@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from . import customknowledge
 from .error_codes import DecodedCode, extract_codes
 from .knowledge import KNOWN_ISSUES, KnownIssue
 from .logformat import LEVEL_RANK, LogEntry
@@ -192,10 +193,33 @@ def severity_rank(severity: str | None) -> int:
 # Known issues
 # --------------------------------------------------------------------------- #
 
-_ANY_KNOWN = re.compile(
+#: One pattern that matches anything any built-in issue could match: a cheap pre-filter.
+_BUILTIN_ANY = re.compile(
     "|".join(f"(?:{issue.pattern.pattern})" for issue in KNOWN_ISSUES),
     re.IGNORECASE | re.DOTALL,
 )
+#: (knowledge version, pre-filter or None, catalog) - rebuilt when the site file changes.
+_CATALOG_CACHE: tuple[int, re.Pattern[str] | None, tuple[KnownIssue, ...]] | None = None
+
+
+def known_issue_catalog() -> tuple[re.Pattern[str] | None, tuple[KnownIssue, ...]]:
+    """Site-specific issues first, then the built-ins, with a combined pre-filter."""
+    global _CATALOG_CACHE
+    custom = customknowledge.active()
+    if _CATALOG_CACHE is None or _CATALOG_CACHE[0] != custom.version:
+        if custom.issues:
+            replaced = {issue.id.lower() for issue in custom.issues}
+            catalog = custom.issues + tuple(i for i in KNOWN_ISSUES if i.id.lower() not in replaced)
+            try:
+                union: re.Pattern[str] | None = re.compile(
+                    "|".join(f"(?:{issue.pattern.pattern})" for issue in catalog), re.IGNORECASE | re.DOTALL
+                )
+            except re.error:
+                union = None  # a site pattern the union cannot hold: match one by one instead
+        else:
+            catalog, union = KNOWN_ISSUES, _BUILTIN_ANY
+        _CATALOG_CACHE = (custom.version, union, catalog)
+    return _CATALOG_CACHE[1], _CATALOG_CACHE[2]
 
 
 def match_haystack(entry: LogEntry) -> str:
@@ -204,12 +228,22 @@ def match_haystack(entry: LogEntry) -> str:
     return entry.message + "\n" + "\n".join(entry.detail[:MATCH_DETAIL_LINES])
 
 
+def known_issue_by_id(issue_id: str | None) -> KnownIssue | None:
+    """Look an issue up by id, site knowledge file first."""
+    wanted = (issue_id or "").strip().lower()
+    if not wanted:
+        return None
+    _, catalog = known_issue_catalog()
+    return next((issue for issue in catalog if issue.id.lower() == wanted), None)
+
+
 def match_known_issue(entry: LogEntry, haystack: str | None = None) -> KnownIssue | None:
     """First known issue (in catalog priority order) whose pattern matches."""
     haystack = haystack if haystack is not None else match_haystack(entry)
-    if not _ANY_KNOWN.search(haystack):
+    union, catalog = known_issue_catalog()
+    if union is not None and not union.search(haystack):
         return None
-    for issue in KNOWN_ISSUES:
+    for issue in catalog:
         if issue.pattern.search(haystack):
             return issue
     return None
@@ -345,7 +379,12 @@ _REASON_MESSAGE = re.compile(r"reasonMessage='(?P<msg>.*?)(?:'\s*,\s*\w+=|'\s*\]
 
 
 def extract_patch_result(entry: LogEntry) -> dict[str, Any] | None:
-    """Fields of a ``PatchDeploymentResult`` completion line (value meanings are not documented)."""
+    """Fields of a ``PatchDeploymentResult`` completion line.
+
+    Tenable does not document what the status and reason numbers mean, so they are
+    reported as logged; a site knowledge file can map them (``patch_deployment_results``)
+    and the meanings are then attached here.
+    """
     if "PatchDeploymentResult" not in entry.message:
         return None
     text = entry.text(MATCH_DETAIL_LINES)
@@ -361,7 +400,7 @@ def extract_patch_result(entry: LogEntry) -> dict[str, Any] | None:
     exception = _FQ_EXCEPTION.search(reason_text)
     if exception:
         evidence.append(f"reasonMessage mentions {exception.group(0)}")
-    return {
+    result = {
         "patch_id": match.group("patch"),
         "request_id": match.group("request"),
         "operation": fields["operation"],
@@ -371,6 +410,15 @@ def extract_patch_result(entry: LogEntry) -> dict[str, Any] | None:
         "reason_message": redact(_WHITESPACE.sub(" ", reason_text))[:400] or None,
         "failure_evidence": evidence,
     }
+    custom = customknowledge.active()
+    if custom.deployment_results:
+        meanings = {
+            f"{name}_meaning": meaning
+            for name in ("operation", "operation_status", "reason_code", "reboot_required")
+            if (meaning := custom.decode_result(name, result.get(name))) is not None
+        }
+        result.update(meanings)
+    return result
 
 
 _MESSAGE_RETRY = re.compile(
