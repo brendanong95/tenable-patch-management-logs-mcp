@@ -90,7 +90,7 @@ Run the server directly (it speaks MCP over stdio, so it will just sit there wai
 client - that is the correct behaviour):
 
 ```bash
-uv run python -m src.server
+uv run python -m tenable_patch_management_logs_mcp
 ```
 
 ## Connecting a client
@@ -113,7 +113,7 @@ Edit `claude_desktop_config.json` (`%APPDATA%\Claude\claude_desktop_config.json`
         "run",
         "python",
         "-m",
-        "src.server"
+        "tenable_patch_management_logs_mcp"
       ],
       "env": {
         "TPM_LOG_SOURCES": "saas-server=C:\\cases\\acme\\logs.zip;clients=C:\\cases\\acme\\TPM-Logs-20260917"
@@ -129,7 +129,7 @@ path (`(Get-Command uv).Source` / `which uv`) as `command`. The `env` block is o
 ### Claude Code
 
 ```bash
-claude mcp add tenable-patch-logs -- uv --directory /absolute/path/to/tenable-patch-management-logs-mcp run python -m src.server
+claude mcp add tenable-patch-logs -- uv --directory /absolute/path/to/tenable-patch-management-logs-mcp run python -m tenable_patch_management_logs_mcp
 ```
 
 Add `--env TPM_LOG_SOURCES=...` to preconfigure sources, or add the same block as above to a
@@ -191,7 +191,7 @@ once (`duplicate_lines_in_other_logs` reports how many repeats were removed).
 example, is an INFO line carrying an exception. Entries with a stack trace or a non-zero Adaptiva
 `Error Code` are raised to ERROR and flagged with `raised_from_lower_level`.
 
-**Known issues** (`src/knowledge.py`) each carry a `confidence`:
+**Known issues** (`tenable_patch_management_logs_mcp/knowledge.py`) each carry a `confidence`:
 
 - `documented`: described by Tenable or Adaptiva, with a source link (for example the 9.2
   Services-sensor DLL issue, or the 9.1.965.x client upgrade failure).
@@ -211,7 +211,7 @@ component servicing (`0x800Fxxxx`), negative decimal HRESULTs and HTTP statuses.
 `Error Code = N` values are shown but never decoded as Windows errors.
 
 **Anomalies** compare a window with the period before it, read from the same logs, so no state
-has to build up. Thresholds are constants at the top of `src/anomaly.py` and are echoed in every
+has to build up. Thresholds are constants at the top of `tenable_patch_management_logs_mcp/anomaly.py` and are echoed in every
 result:
 
 | Constant | Default | Meaning |
@@ -233,7 +233,8 @@ are shown as written. TPM 10.2 SaaS server logs and Windows client logs were obs
 ## Layout
 
 ```
-src/
+tenable_patch_management_logs_mcp/
+  __main__.py      python -m tenable_patch_management_logs_mcp
   server.py        MCP entrypoint and the eleven tool definitions
   sources.py       Source configuration, bundle extraction, device / role / rotation detection
   logformat.py     Line layouts, multi-line entries, encodings, time spans
@@ -292,7 +293,7 @@ under 5 seconds.
 ### 4. Through an MCP client
 
 ```bash
-npx @modelcontextprotocol/inspector uv --directory . run python -m src.server
+npx @modelcontextprotocol/inspector uv --directory . run python -m tenable_patch_management_logs_mcp
 ```
 
 Or connect Claude Desktop / Claude Code (above) and ask one of the example questions.

@@ -7,8 +7,8 @@ import json
 
 import pytest
 
-from src import server
-from src.sources import SourceRegistry
+from tenable_patch_management_logs_mcp import server
+from tenable_patch_management_logs_mcp.sources import SourceRegistry
 from tests.sample_logs import PLANTED_KEY, PLANTED_TOKEN
 
 READ_ONLY_TOOLS = {

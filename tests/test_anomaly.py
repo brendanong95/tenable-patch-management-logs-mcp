@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src import anomaly
+from tenable_patch_management_logs_mcp import anomaly
 
 
 def by_type(result: dict, finding_type: str) -> list[dict]:

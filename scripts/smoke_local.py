@@ -24,7 +24,7 @@ os.environ["TPM_MCP_DATA_DIR"] = str(WORK / "data")
 os.environ["TPM_AUTO_DISCOVER"] = "false"
 os.environ.pop("TPM_LOG_SOURCES", None)
 
-from src import server  # noqa: E402
+from tenable_patch_management_logs_mcp import server  # noqa: E402
 from tests.sample_logs import PLANTED_KEY, PLANTED_TOKEN, build_sample_tree  # noqa: E402
 
 failures: list[str] = []

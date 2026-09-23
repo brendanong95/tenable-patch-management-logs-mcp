@@ -22,7 +22,7 @@ from dotenv import find_dotenv, load_dotenv  # noqa: E402
 
 load_dotenv(find_dotenv(usecwd=True))
 
-from src import server  # noqa: E402
+from tenable_patch_management_logs_mcp import server  # noqa: E402
 
 WINDOW = sys.argv[1] if len(sys.argv) > 1 else "7d"
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.error_codes import decode_any, decode_exit_code, decode_hresult, extract_codes
+from tenable_patch_management_logs_mcp.error_codes import decode_any, decode_exit_code, decode_hresult, extract_codes
 
 
 def test_win32_hresults_are_unwrapped():

@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from src.errors import InputError, NoSourcesError, SourceError
-from src.sources import SourceRegistry, detect_device, detect_role, logical_name
+from tenable_patch_management_logs_mcp.errors import InputError, NoSourcesError, SourceError
+from tenable_patch_management_logs_mcp.sources import SourceRegistry, detect_device, detect_role, logical_name
 from tests.conftest import make_registry
 from tests.sample_logs import build_single_client_log, malicious_zip, zip_folder
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from src.logformat import (
+from tenable_patch_management_logs_mcp.logformat import (
     LAYOUT_ADAPTIVA,
     LAYOUT_BLOCKS,
     LAYOUT_MSI,

@@ -7,7 +7,7 @@ hands back a pile of raw lines expecting the caller to do the counting.
 
 Run with stdio transport::
 
-    uv run python -m src.server
+    uv run python -m tenable_patch_management_logs_mcp
 """
 
 from __future__ import annotations

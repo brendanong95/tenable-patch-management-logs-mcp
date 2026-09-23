@@ -6,7 +6,7 @@ from datetime import datetime
 
 import pytest
 
-from src.classifier import (
+from tenable_patch_management_logs_mcp.classifier import (
     classify,
     effective_severity,
     extract_detections,
@@ -19,7 +19,7 @@ from src.classifier import (
     normalize_signature,
     redact,
 )
-from src.logformat import LogEntry
+from tenable_patch_management_logs_mcp.logformat import LogEntry
 from tests.sample_logs import PLANTED_KEY, PLANTED_TOKEN, SERVICES_SENSOR_ENTRY
 
 

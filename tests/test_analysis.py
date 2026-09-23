@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from src import analysis
-from src.errors import InputError
+from tenable_patch_management_logs_mcp import analysis
+from tenable_patch_management_logs_mcp.errors import InputError
 from tests.conftest import make_registry
 from tests.sample_logs import PLANTED_KEY, PLANTED_TOKEN, REJECTED_IP
 
@@ -288,7 +288,7 @@ def test_check_sources_guides_towards_missing_client_logs(tmp_path, sample_tree)
 
 
 def test_check_sources_without_anything_configured(tmp_path):
-    from src.sources import SourceRegistry
+    from tenable_patch_management_logs_mcp.sources import SourceRegistry
 
     result = analysis.check_sources(SourceRegistry(data_dir=tmp_path / "d", env={"TPM_AUTO_DISCOVER": "false"}))
     assert result["ok"] is False and result["error"] == "no_sources"
