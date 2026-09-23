@@ -1,5 +1,7 @@
 # tenable-patch-mcp
 
+[![Tests](https://github.com/brendanong95/tenable-patch-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/brendanong95/tenable-patch-mcp/actions/workflows/tests.yml)
+
 An MCP server that does the log digging for **Tenable Patch Management (TPM)**, for both
 **SaaS and on-prem** deployments. Point it at server logs (the Admin Portal zip, or the
 on-prem logs folder) and client logs (device folders, collector bundles, or a log requested
