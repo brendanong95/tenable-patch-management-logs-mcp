@@ -1,5 +1,5 @@
 [project]
-name = "tenable-patch-mcp"
+name = "tenable-patch-management-logs-mcp"
 version = "0.1.0"
 description = "MCP server that digs through Tenable Patch Management (SaaS and on-prem) server and client logs"
 readme = "README.md"
@@ -29,12 +29,12 @@ dev = [
 ]
 
 [project.scripts]
-tenable-patch-mcp = "src.server:main"
+tenable-patch-management-logs-mcp = "src.server:main"
 
 [project.urls]
-Homepage = "https://github.com/brendanong95/tenable-patch-mcp"
-Repository = "https://github.com/brendanong95/tenable-patch-mcp"
-Issues = "https://github.com/brendanong95/tenable-patch-mcp/issues"
+Homepage = "https://github.com/brendanong95/tenable-patch-management-logs-mcp"
+Repository = "https://github.com/brendanong95/tenable-patch-management-logs-mcp"
+Issues = "https://github.com/brendanong95/tenable-patch-management-logs-mcp/issues"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Collect Tenable Patch Management client logs on Linux or macOS into a bundle that
-# tenable-patch-mcp reads directly:  <HOST>/PatchClient/logs/...
+# tenable-patch-management-logs-mcp reads directly:  <HOST>/PatchClient/logs/...
 #
 #   sudo ./collect-tpm-logs.sh [days] [output_dir]
 #

@@ -1,6 +1,6 @@
-# tenable-patch-mcp
+# tenable-patch-management-logs-mcp
 
-[![Tests](https://github.com/brendanong95/tenable-patch-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/brendanong95/tenable-patch-mcp/actions/workflows/tests.yml)
+[![Tests](https://github.com/brendanong95/tenable-patch-management-logs-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/brendanong95/tenable-patch-management-logs-mcp/actions/workflows/tests.yml)
 
 An MCP server that does the log digging for **Tenable Patch Management (TPM)**, for both
 **SaaS and on-prem** deployments. Point it at server logs (the Admin Portal zip, or the
@@ -105,11 +105,11 @@ Edit `claude_desktop_config.json` (`%APPDATA%\Claude\claude_desktop_config.json`
 ```json
 {
   "mcpServers": {
-    "tenable-patch": {
+    "tenable-patch-logs": {
       "command": "uv",
       "args": [
         "--directory",
-        "C:\\path\\to\\tenable-patch-mcp",
+        "C:\\path\\to\\tenable-patch-management-logs-mcp",
         "run",
         "python",
         "-m",
@@ -129,7 +129,7 @@ path (`(Get-Command uv).Source` / `which uv`) as `command`. The `env` block is o
 ### Claude Code
 
 ```bash
-claude mcp add tenable-patch -- uv --directory /absolute/path/to/tenable-patch-mcp run python -m src.server
+claude mcp add tenable-patch-logs -- uv --directory /absolute/path/to/tenable-patch-management-logs-mcp run python -m src.server
 ```
 
 Add `--env TPM_LOG_SOURCES=...` to preconfigure sources, or add the same block as above to a

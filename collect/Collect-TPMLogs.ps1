@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
   Collect Tenable Patch Management logs from one or more Windows devices into a bundle
-  that tenable-patch-mcp reads directly (one folder per device).
+  that tenable-patch-management-logs-mcp reads directly (one folder per device).
 
 .DESCRIPTION
   For each device it copies, read-only:

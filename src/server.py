@@ -1,4 +1,4 @@
-"""tenable-patch-mcp - MCP server over Tenable Patch Management server and client logs.
+"""tenable-patch-management-logs-mcp - MCP server over Tenable Patch Management logs.
 
 Entrypoint and tool registration only. Parsing lives in ``logformat``, file discovery
 in ``sources``, enrichment in ``classifier``, rollups in ``analysis`` and baseline
@@ -32,7 +32,7 @@ from . import __version__, analysis, anomaly
 from .errors import TpmLogError
 from .sources import SourceRegistry
 
-SERVER_NAME = "tenable-patch-mcp"
+SERVER_NAME = "tenable-patch-management-logs-mcp"
 SERVER_VERSION = __version__
 
 logging.basicConfig(
